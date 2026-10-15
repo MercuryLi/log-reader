@@ -107,3 +107,4 @@ MaxIdleConns = 5
 | MYSQL_CONN_RETRY | 建连重试累计次数 |
 | MYSQL_CONN_OK | 建连成功累计次数 |
 | MYSQL_CONN_LOST | 运行期断连次数（写重试耗尽/探活失败触发） |
+| LOGID_EMPTY | `logid` 为 0 的明细行数（bfenetworks/bfe#1417）：该行无法按请求级判别列去重，退化为旧四元组语义（同秒同 Key 同模型的并发请求仍会互相覆盖）。正常应为 0——bfe 侧已保证 `logid` 非 0，非 0 即需排查 |
