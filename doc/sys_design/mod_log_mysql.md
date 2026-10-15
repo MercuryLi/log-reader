@@ -4,6 +4,7 @@
 > - [doc/modifications/2026-09-15-add-mod-log-mysql-plugin/design-changes.md](../modifications/2026-09-15-add-mod-log-mysql-plugin/design-changes.md)（模块引入）
 > - [doc/modifications/2026-09-29-mod-log-mysql-startup-connect-retry/design-changes.md](../modifications/2026-09-29-mod-log-mysql-startup-connect-retry/design-changes.md)（一期）
 > - [doc/modifications/2026-09-30-mod-log-mysql-runtime-reconnect/design-changes.md](../modifications/2026-09-30-mod-log-mysql-runtime-reconnect/design-changes.md)（二期）
+> - [doc/modifications/2026-10-13-issue-1417-dedup-key-logid/design-changes.md](../modifications/2026-10-13-issue-1417-dedup-key-logid/design-changes.md)（幂等键补请求级判别列 `logid`，issue #1417）
 
 ## 1. 背景与目标
 
@@ -25,17 +26,17 @@
 - 不做聚合计算——分钟级聚合由 ai-gateway-api 侧 JOB 完成（与本模块解耦）；
 - 不做自动建表/改表——DDL 归 ai-gateway-api 仓库持有，本模块账号无 DDL 权限；
 - 不做死信落盘——重试耗尽且重连后补写仍失败的批丢弃计数，依赖幂等键支持 `-b` 补读重放；
-- 不保证断连窗口内的严格行序——pending 批优先补写 + 队列重排使窗口内行序与到达序可能不一致，消费侧以 `log_time`+`logid` 为准；
+- 不保证断连窗口内的严格行序——pending 批优先补写 + 队列重排使窗口内行序与到达序可能不一致，消费侧以 `log_time`+`logid` 为准（该契约自 issue #1417 修复后才真正成立：此前 `logid` 恒 0，不具备定位能力）；
 - v1 仅 MySQL；PostgreSQL 预留 `database/sql` 驱动替换点，不实现。
 
 ## 2. 术语定义
 
 | 术语 | 定义 |
 |------|------|
-| 幂等键 | 唯一键 `(hostid, log_time, ai_apikey_id, ai_requested_model)`，冲突覆盖更新 |
+| 幂等键 | 唯一键 `(hostid, log_time, ai_apikey_id, ai_requested_model, logid)`，冲突覆盖更新；`logid` 为请求级判别列（issue #1417） |
 | 打平列 | `level1Name/level1 … level5Name/level5`，写入时由 `ai_apikeytags` 打平生成 |
 | 零值规则 | 字符串空串写 NULL、数值/布尔原样、空 JSON 写 NULL（下游聚合 IFNULL 归一） |
-| 补读重放 | 以 `log_reader -b` 从头重读 pb 日志，依赖幂等键安全覆盖 |
+| 补读重放 | 以 `log_reader -b` 从头重读 pb 日志，依赖幂等键安全覆盖（同 `logid` 命中覆盖） |
 | 分区管理 JOB | ai-gateway-api 侧的按天 RANGE 分区创建/清理任务（本模块不参与） |
 | DOWN/UP | 连接状态机的两个态：`MYSQL_CONN_STATE` 键值；DOWN = 连接池已摘除（`db` 为 nil），写协程挂起缓冲 |
 | markDown | 置 DOWN 的唯一入口（写重试耗尽或探活失败触发）：摘除并关闭连接池、`MYSQL_CONN_LOST+1`、唤醒 supervisor 重连 |
@@ -48,6 +49,7 @@
 PbLogReader 批次分发
    └─► mod_log_mysql.Update(batch)
          ├─ 过滤：仅 BfeLogType_Request
+         ├─ LOGID_EMPTY 计数（logid 为 0 的行，issue #1417）
          ├─ mod_fields 抽取（与 mod_kafka 共用）→ field_mapper 组装行（99 列固定列序）
          │    （字符串零值→NULL；apikeytags 打平；JSON 列 marshal）
          └─ RecordWriter.Enqueue(row)
@@ -70,9 +72,10 @@ connSupervisor: DOWN 期按 ConnectRetryIntervalMs 重试 Connect；
 | 项 | 设计 |
 |----|------|
 | 语句 | 单事务多值 `INSERT INTO <table> (99 列) VALUES (...),(...) ON DUPLICATE KEY UPDATE col=VALUES(col), ...`（全列覆盖） |
-| 幂等 | 唯一键四元组与 Doris UNIQUE KEY 完全一致；重发/重启/`-b` 补读均不产生重复行 |
-| 唯一键取舍 | 唯一键**不含 `logid`**：同一分钟内同 Key 同模型的多条请求只留一条（与 Doris 语义一致，以聚合可接受为前提） |
-| 零值规则 | 字符串空串 → NULL；数值/布尔原样（`ai_stream=0`、`ai_retry_count=0`）；nil/空 JSON → NULL |
+| 幂等 | 唯一键含请求级判别列 `logid`：只有**同一请求重放**（同 `logid`）才命中覆盖 → 重发/重启/`-b` 补读均不产生重复行（issue #1417） |
+| 唯一键取舍 | 唯一键**必须含 `logid`**：四列键下 `log_time` 是秒级（见下），同秒同 Key 同模型的并发请求被全列覆盖压成 1 行——生产实测丢率恰为 (n−1)/n（窗口 13.5%），被覆盖行的 tokens/cost 从求和中整体消失。原设计"唯一键不含 `logid`、以聚合可接受为前提"的取舍**已被 issue #1417 推翻**；含 `logid` 后并发请求各自成行 |
+| `logid=0` 的行 | `0` 参与键比较 → 退化为旧四元组语义（同秒并发仍互相覆盖）。bfe 侧已保证非 0；本模块以 `LOGID_EMPTY` 计数暴露这类行（正常应为 0） |
+| 零值规则 | 字符串空串 → NULL；数值/布尔原样（`ai_stream=0`、`ai_retry_count=0`）；`logid` 恒写整数、不写 NULL（列已 `NOT NULL DEFAULT 0`）；nil/空 JSON → NULL |
 | 时间列 | `log_time` 由 pb `timestamp`（Unix 秒）写时转 DATETIME（Doris 链路为 Routine Load `FROM_UNIXTIME`，同口径） |
 | 标签打平 | `levelNName/levelN` 写时从 `ai_apikeytags` 对象打平；无标签 → NULL |
 
@@ -97,7 +100,7 @@ UP ──(写重试耗尽 / 探活失败)──► markDown ──► DOWN ─�
 
 ### 4.3 表结构（归 ai-gateway-api 仓库持有）
 
-`bfe_ai_request_log` 99 列，与 Doris 同名同列；差异仅复合列类型（`ARRAY<STRUCT>` → `JSON`，共 7 个 JSON 列）。**DDL 权威文件在 ai-gateway-api 仓库 `db_ddl_report_mysql.sql`**（与聚合表 `bfe_ai_metrics_1m` 同文件），归属理由：
+`bfe_ai_request_log` 99 列，与 Doris 同名同列；两侧差异：复合列类型（`ARRAY<STRUCT>` → `JSON`，共 7 个 JSON 列）与**唯一键**（本侧含请求级判别列 `logid`，Doris 侧仍是四元组、待同改，issue #1417）。**DDL 权威文件在 ai-gateway-api 仓库 `db_ddl_report_mysql.sql`**（与聚合表 `bfe_ai_metrics_1m` 同文件），归属理由：
 
 1. ai-gateway-api 依赖面最广：聚合 JOB 按列取数、分区管理 JOB 执行 `ALTER TABLE`、明细查询，且运行时持有 DDL 权限；本模块仅按固定列清单 INSERT，账号无 DDL 权限；
 2. ai-gateway-api 是代码库中唯一有 MySQL DDL 管理传统的仓库（`db_ddl.sql` 体系），两表与其同发布、同演进；
@@ -107,7 +110,7 @@ UP ──(写重试耗尽 / 探活失败)──► markDown ──► DOWN ─�
 
 ### 4.4 索引与分区
 
-- 唯一键 `uk_dedup (hostid, log_time, ai_apikey_id, ai_requested_model)`（约 2565 字节 < 3072 InnoDB 上限；含分区列满足 MySQL 分区表约束）；
+- 唯一键 `uk_dedup (hostid, log_time, ai_apikey_id, ai_requested_model, logid)`（约 2579 字节 < 3072 InnoDB 上限；含分区列满足 MySQL 分区表约束）；
 - 二级索引面向报表查询过滤维度：`idx_model_time`、`idx_apikey_time`、`idx_provider_time`、`idx_host_time`、`idx_status_time`；
 - 按天 `RANGE (TO_DAYS(log_time))` 分区；首个分区由建表 DDL 提供，新分区创建与过期分区 DROP 由 ai-gateway-api 分区管理 JOB 负责（对齐 Doris 动态分区语义，保留期默认 7 天）。
 
@@ -150,6 +153,7 @@ UP ──(写重试耗尽 / 探活失败)──► markDown ──► DOWN ─�
 | `MYSQL_CONN_RETRY` | 建连重试累计次数 | 按重试间隔节奏增长即 supervisor 工作正常 |
 | `MYSQL_CONN_OK` | 建连成功累计次数 | 正常运行恒为 1，每次运行期重连 +1 |
 | `MYSQL_CONN_LOST` | 运行期断连次数（markDown 触发） | 持续增长 = 链路抖动或 MySQL 不稳定 |
+| `LOGID_EMPTY` | `logid` 为 0 的明细行数（issue #1417） | **非 0 即需排查**：该类行无法按请求级判别列去重，退化为旧四元组语义（同秒同 Key 同模型的并发请求仍会互相覆盖）；bfe 侧已保证 `logid` 非 0 |
 
 ## 5. 降级与兼容性
 
@@ -161,22 +165,23 @@ UP ──(写重试耗尽 / 探活失败)──► markDown ──► DOWN ─�
 | 配置错误 | 配置文件缺失/必填字段为空仍 **fail-fast**：`Init` 返回错误，进程退出（连通性错误不退出，二者分界见模块文档） |
 | 认证失败/库不存在（1045/1049） | 后台重试不自愈：进程存活、`STATE=DOWN` 常驻、节流日志提示根因；修复方式是改配置重启 |
 | 表不存在（写时 1146） | 重连后补写仍失败，该批计数 `SEND_MYSQL_FAILED` 丢弃（结构性错误不重试） |
+| 唯一键仍为四元组（DDL 未升级） | 行为退化为修复前语义（同秒并发丢 (n−1)/n）；本模块无需发版，DDL 升级后自动生效（键不在代码中） |
 | pb 加字段 | 本模块列清单不变（与 Doris 表对齐演进，两侧同步加列）；未纳入字段不落库 |
 | 与 mod_kafka 并存 | 支持（Modules 多模块），但单集群建议只启用一种落库形态，避免两条链路数据缺口窗口不一致 |
 | 进程重启 | 从文件尾读（丢窗口）或 `-b` 全量重放（幂等覆盖），同框架语义 |
-| 回滚 | 一期/二期配置均为可选带默认值；回滚二进制需同步回退 conf（gcfg 对未知字段报错，见各期变更文档） |
+| 回滚 | 一期/二期配置均为可选带默认值；回滚二进制需同步回退 conf（gcfg 对未知字段报错，见各期变更文档）；`LOGID_EMPTY` 为新增计数键，旧二进制回滚后该计数自然消失，无配置影响 |
 
 ## 6. 关键文件索引
 
 | 文件 | 内容 |
 |------|------|
-| `reader_modules/mod_log_mysql/mod_log_mysql.go` | ModuleLogMysql：接口实现、Init（尽力建连、连通性错误非致命）、Update/Close、监控注册 |
+| `reader_modules/mod_log_mysql/mod_log_mysql.go` | ModuleLogMysql：接口实现、Init（尽力建连、连通性错误非致命）、Update/Close（含 `LOGID_EMPTY` 计数）、监控注册 |
 | `reader_modules/mod_log_mysql/field_mapper.go` | 99 列固定列序行组装、零值规则、标签打平、JSON marshal |
 | `reader_modules/mod_log_mysql/record_writer.go` | 缓冲队列、攒批、事务批插（超时约束）、退避重试、连接状态机（connSupervisor/markDown/epoch connCh/持有补写）、drain |
 | `reader_modules/mod_log_mysql/conf_mod_log_mysql.go` | INI 配置解析与校验 |
 | `reader_modules/mod_fields/` | 公共字段抽取包（自 mod_kafka 上移，两模块共用） |
 | `reader_modules/all_modules.go` | 注册新模块 |
-| `tests/integration/implementation/scenario-LR03-mysql-write/` | 集成测试：列映射/幂等重放/零值规则/批次拆分 |
+| `tests/integration/implementation/scenario-LR03-mysql-write/` | 集成测试：列映射/幂等重放/零值规则/批次拆分/同秒并发不丢行（issue #1417） |
 | `tests/integration/implementation/scenario-LR04-mysql-startup-connect-retry/` | 集成测试：启动不可达后台重试（TC-04-01）、配置错误 fail-fast（TC-04-02）、运行期断连自动重连（TC-04-03） |
 
-关联文档：[overview.md](./overview.md)（系统总体设计）、[mod_log_mysql.md](../modules/mod_log_mysql/mod_log_mysql.md)（模块参考）、[output-columns.md](../modules/mod_log_mysql/output-columns.md)（列清单）、实施变更文档（[模块引入](../modifications/2026-09-15-add-mod-log-mysql-plugin/design-changes.md)、[一期·启动重试](../modifications/2026-09-29-mod-log-mysql-startup-connect-retry/design-changes.md)、[二期·运行期重连](../modifications/2026-09-30-mod-log-mysql-runtime-reconnect/design-changes.md)）。
+关联文档：[overview.md](./overview.md)（系统总体设计）、[mod_log_mysql.md](../modules/mod_log_mysql/mod_log_mysql.md)（模块参考）、[output-columns.md](../modules/mod_log_mysql/output-columns.md)（列清单）、实施变更文档（[模块引入](../modifications/2026-09-15-add-mod-log-mysql-plugin/design-changes.md)、[一期·启动重试](../modifications/2026-09-29-mod-log-mysql-startup-connect-retry/design-changes.md)、[二期·运行期重连](../modifications/2026-09-30-mod-log-mysql-runtime-reconnect/design-changes.md)、[issue #1417 幂等键](../modifications/2026-10-13-issue-1417-dedup-key-logid/design-changes.md)）。

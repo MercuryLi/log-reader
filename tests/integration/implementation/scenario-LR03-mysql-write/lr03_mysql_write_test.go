@@ -457,16 +457,16 @@ func TestLR03_ZeroValueToNull(t *testing.T) {
 		Product:   &product,
 		LogType:   &logType,
 		RequestLog: &bfe_access_pb.RequestLog{
-			ErrCode:    proto.String(""),
-			ErrMsg:     proto.String(""),
-			AddrInfo:   &bfe_access_pb.ConnAddrInfo{BfeIp: &zeroIP, SockSrcIp: &zeroIP, IsTrustSrcIp: &notTrust},
-			ClientIp:   proto.Uint32(0),
-			ReqNum:     proto.Uint32(0),
-			Proto:      proto.String(""),
-			HeaderHost: proto.String(""),
-			OriginUri:  proto.String(""),
-			Method:     proto.String(""),
-			AllTime:    proto.Uint32(0),
+			ErrCode:          proto.String(""),
+			ErrMsg:           proto.String(""),
+			AddrInfo:         &bfe_access_pb.ConnAddrInfo{BfeIp: &zeroIP, SockSrcIp: &zeroIP, IsTrustSrcIp: &notTrust},
+			ClientIp:         proto.Uint32(0),
+			ReqNum:           proto.Uint32(0),
+			Proto:            proto.String(""),
+			HeaderHost:       proto.String(""),
+			OriginUri:        proto.String(""),
+			Method:           proto.String(""),
+			AllTime:          proto.Uint32(0),
 			AiRequestedModel: proto.String("zero-model"),
 		},
 	}
@@ -515,7 +515,7 @@ func TestLR03_BatchSplit(t *testing.T) {
 	}
 
 	rows, err := e.mysqlEnv.DB().Query(
-		`SELECT logid, ai_requested_model FROM `+tableName+` WHERE logid BETWEEN 90001 AND 90025`)
+		`SELECT logid, ai_requested_model FROM ` + tableName + ` WHERE logid BETWEEN 90001 AND 90025`)
 	if err != nil {
 		t.Fatalf("query batch rows failed: %v", err)
 	}
@@ -595,16 +595,16 @@ func TestLR03_NewFieldsWriteAndZeroRules(t *testing.T) {
 		Product:   &zeroProduct,
 		LogType:   &zeroType,
 		RequestLog: &bfe_access_pb.RequestLog{
-			ErrCode:    proto.String(""),
-			ErrMsg:     proto.String(""),
-			AddrInfo:   &bfe_access_pb.ConnAddrInfo{BfeIp: &zeroIP, SockSrcIp: &zeroIP, IsTrustSrcIp: &notTrust},
-			ClientIp:   proto.Uint32(0),
-			ReqNum:     proto.Uint32(0),
-			Proto:      proto.String("HTTP/1.1"),
-			HeaderHost: proto.String("zero.example.org"),
-			OriginUri:  proto.String("/v1/chat"),
-			Method:     proto.String("POST"),
-			AllTime:    proto.Uint32(0),
+			ErrCode:          proto.String(""),
+			ErrMsg:           proto.String(""),
+			AddrInfo:         &bfe_access_pb.ConnAddrInfo{BfeIp: &zeroIP, SockSrcIp: &zeroIP, IsTrustSrcIp: &notTrust},
+			ClientIp:         proto.Uint32(0),
+			ReqNum:           proto.Uint32(0),
+			Proto:            proto.String("HTTP/1.1"),
+			HeaderHost:       proto.String("zero.example.org"),
+			OriginUri:        proto.String("/v1/chat"),
+			Method:           proto.String("POST"),
+			AllTime:          proto.Uint32(0),
 			AiRequestedModel: proto.String("zero-intent-model"),
 		},
 	}
@@ -657,4 +657,69 @@ func TestLR03_NewFieldsWriteAndZeroRules(t *testing.T) {
 	assertNullFloat(t, er.aiIntentConfidence, "ai_intent_confidence", 0)
 	assertNullInt(t, er.aiIntentLatencyUs, "ai_intent_latency_us", 0)
 	assertNullInt(t, er.aiIntentCacheHit, "ai_intent_cache_hit", 0)
+}
+
+// TestLR03_ConcurrentRowsSameSecondSurvive (bfenetworks/bfe#1417) verifies the
+// report table keeps every concurrent row of one API key and model inside one
+// second. The legacy dedup key (hostid, log_time, ai_apikey_id,
+// ai_requested_model) had a second-granularity log_time, while the writer
+// overwrites the whole row on conflict — so such concurrent rows collapsed into
+// one (n requests -> 1 row, loss (n-1)/n). MakeRequestLog fixes
+// hostid / log_time (1782353290) / ai_apikey_id ("key-id-123") for every call,
+// so passing one model with two logids reproduces exactly that precondition.
+func TestLR03_ConcurrentRowsSameSecondSurvive(t *testing.T) {
+	e := newTestEnv(t)
+	defer e.Close()
+
+	const logidA, logidB = uint64(91001), uint64(91002)
+	logA := common.MakeRequestLog(logidA, bfe_access_pb.ProductID_BFE,
+		"dedup.example.org", "/v1/chat", "same-second-model")
+	logB := common.MakeRequestLog(logidB, bfe_access_pb.ProductID_BFE,
+		"dedup.example.org", "/v1/chat", "same-second-model")
+	e.logGen.MustWriteBfeLog(t, logA)
+	e.logGen.MustWriteBfeLog(t, logB)
+
+	e.waitRows(2, 30*time.Second)
+	if got := e.mysqlEnv.TableCount(t, tableName); got != 2 {
+		t.Fatalf("row count = %d, want 2: rows sharing (hostid, log_time, ai_apikey_id, ai_requested_model) must all survive", got)
+	}
+
+	// Both rows must be individually present, keyed by their own logid.
+	rows, err := e.mysqlEnv.DB().Query(
+		`SELECT logid, ai_input_tokens FROM ` + tableName + ` ORDER BY logid`)
+	if err != nil {
+		t.Fatalf("query rows failed: %v", err)
+	}
+	defer rows.Close()
+
+	got := make(map[int64]int64)
+	for rows.Next() {
+		var logid, inTokens int64
+		if err := rows.Scan(&logid, &inTokens); err != nil {
+			t.Fatalf("scan row failed: %v", err)
+		}
+		got[logid] = inTokens
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate rows failed: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("distinct logids = %d, want 2 (a concurrent row was collapsed into another)", len(got))
+	}
+	for _, want := range []int64{int64(logidA), int64(logidB)} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("logid %d missing: its row was overwritten by the other concurrent row", want)
+		}
+	}
+
+	// Re-delivering one and the same request (same logid) must hit the overwrite,
+	// not append a duplicate row.
+	replay := proto.Clone(logA).(*bfe_access_pb.BfeLog)
+	replay.RequestLog.AiOutputTokens = proto.Int64(777)
+	e.logGen.MustWriteBfeLog(t, replay)
+	e.waitTokens(logidA, 777, 20*time.Second)
+
+	if n := e.mysqlEnv.TableCount(t, tableName); n != 2 {
+		t.Fatalf("row count after replay = %d, want 2 (same logid must be overwritten, not appended)", n)
+	}
 }

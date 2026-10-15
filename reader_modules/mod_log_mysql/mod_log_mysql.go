@@ -25,6 +25,7 @@ import (
 	bfe_access_pb "github.com/bfenetworks/bfe-access-pb/bfe_access_pb"
 	"github.com/rainway-ai-gateway/log-reader/reader_conf"
 	"github.com/rainway-ai-gateway/log-reader/reader_module"
+	"github.com/rainway-ai-gateway/log-reader/reader_modules/mod_fields"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -40,6 +41,7 @@ var COUNTER_KEYS = []string{
 	"MYSQL_CONN_RETRY",    // 建连重试累计次数（重试协程每次失败 +1）
 	"MYSQL_CONN_OK",       // 建连成功累计次数
 	"MYSQL_CONN_LOST",     // 运行期断连次数（写重试耗尽/探活失败触发 markDown 计数）
+	"LOGID_EMPTY",         // logid 为 0 的行数（bfenetworks/bfe#1417）：该行无法按请求级判别列去重，退化为旧四元组语义
 }
 
 // state 键值（非 counter）：MYSQL_CONN_STATE = UP / DOWN，
@@ -155,6 +157,14 @@ func (m *ModuleLogMysql) Update(bfeLogs []*bfe_access_pb.BfeLog) {
 			continue
 		}
 		m.state.Inc("RECEIVED_REQ", 1)
+
+		// logid 为 0 的行无法按请求级判别列去重（bfenetworks/bfe#1417）：新唯一键
+		// (hostid, log_time, ai_apikey_id, ai_requested_model, logid) 下 0 会参与比较，
+		// 该行退化为旧四元组语义——同秒同 Key 同模型的并发请求仍会互相覆盖。
+		// bfe 侧已保证 logid 非 0；此处计数使该形态不再静默（建议阈值 0、超阈告警）。
+		if _, isZero := mod_fields.Extract("logid", bfeLog); isZero {
+			m.state.Inc("LOGID_EMPTY", 1)
+		}
 
 		row, err := m.mapper.ToRow(bfeLog)
 		if err != nil {

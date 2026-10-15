@@ -2,8 +2,9 @@
 -- bfe_ai_request_log 建表语句（LR03 集成测试内嵌副本）
 --
 -- 权威 DDL 归 ai-gateway-api 仓库 db_ddl_report_mysql.sql 明细表（2026-09-27
--- 99 列版，含 ai-cache/流量镜像/ai-intent 10 新列），本副本以其为基准重新生成，
--- 权威 DDL 后续变更时应同步重新生成。
+-- 99 列版，含 ai-cache/流量镜像/ai-intent 10 新列；2026-10-13 起基准另含
+-- bfenetworks/bfe#1417：uk_dedup 为五列、logid 收紧为 NOT NULL DEFAULT 0），
+-- 本副本以其为基准重新生成，权威 DDL 后续变更时应同步重新生成。
 -- 列清单/列序/类型与权威 DDL 明细表保持一致，并有三处测试化调整（权威 DDL
 -- 变更时必须同样处理）：
 -- 1. 长文本列（origin_uri/final_uri/x_forward_for/authorization/referrer/
@@ -23,7 +24,9 @@ CREATE TABLE IF NOT EXISTS bfe_ai_request_log (
     log_time                DATETIME      NOT NULL,
     ai_apikey_id            VARCHAR(256)  DEFAULT NULL,
     ai_requested_model      VARCHAR(128)  DEFAULT NULL,
-    logid                   BIGINT        DEFAULT NULL,
+    -- logid：BFE 逐请求唯一标识（非 0）。NOT NULL DEFAULT 0 而非可空：MySQL 唯一键
+    -- 视 NULL 互不相等，可空会让缺 id 的行逃出全部去重（同一行重放插入重复行）。
+    logid                   BIGINT        NOT NULL DEFAULT 0,
     product                 VARCHAR(64)   DEFAULT NULL,
     log_tag                 VARCHAR(64)   DEFAULT NULL,
     -- 客户端连接
@@ -129,8 +132,9 @@ CREATE TABLE IF NOT EXISTS bfe_ai_request_log (
     ai_intent_latency_us    BIGINT        DEFAULT NULL,
     ai_intent_cache_hit     TINYINT       DEFAULT NULL,
     ai_intent_questions_version VARCHAR(32) NOT NULL DEFAULT '',
-    -- 幂等键：同键冲突覆盖（log-reader 重发/-b 补读安全）
-    UNIQUE KEY uk_dedup (hostid, log_time, ai_apikey_id, ai_requested_model),
+    -- 幂等键：含请求级判别列 logid（bfenetworks/bfe#1417）——同秒同 Key 同模型的
+    -- 并发请求各自成行；只有同一请求重放（同 logid）才命中覆盖（重发/-b 补读仍安全）
+    UNIQUE KEY uk_dedup (hostid, log_time, ai_apikey_id, ai_requested_model, logid),
     KEY idx_model_time (ai_target_model, log_time),
     KEY idx_apikey_time (ai_apikey_id, log_time),
     KEY idx_provider_time (ai_provider, log_time),

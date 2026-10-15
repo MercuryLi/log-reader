@@ -50,7 +50,7 @@ Close: 两协程退出；writeLoop drain 残留批后最终 flush；
 - **日志节流**：启动/重连失败第 1–3 次 Error、之后每 10 次 Warn 一条；建连成功 Info 一次；`markDown` 时 Error 一条（含原因）；
 - **认证失败/库不存在**靠重试不自愈：重试日志持续提示根因，修复方式是改配置重启（log-reader 无配置热加载）；
 - **可选探活**：`HealthPingIntervalMs > 0` 时 supervisor 在 UP 期周期 `PingContext`，失败即 `markDown`——面向半开连接（防火墙断链、NAT 超时）场景更早发现断连，默认关闭；
-- **行序**：断连窗口内 pending 批优先补写 + 队列重排，窗口内行序与到达序可能不一致；消费侧以 `log_time`+`logid` 为准，分钟聚合报表不受影响。
+- **行序**：断连窗口内 pending 批优先补写 + 队列重排，窗口内行序与到达序可能不一致；消费侧以 `log_time`+`logid` 为准，分钟聚合报表不受影响（该契约自 bfenetworks/bfe#1417 修复后才真正成立——此前 `logid` 恒 0，不具备定位能力；修复后唯一键含 `logid`，同秒并发各自成行）。
 
 ## 基础配置
 
@@ -86,7 +86,7 @@ Modules = mod_log_mysql
 
 ## 写入语义要点
 
-- **幂等**：唯一键 `(hostid, log_time, ai_apikey_id, ai_requested_model)`，冲突覆盖更新——log-reader 重启补读（`-b`）或重发不会产生重复行；
+- **幂等**：唯一键 `(hostid, log_time, ai_apikey_id, ai_requested_model, logid)`，冲突覆盖更新——只有**同一请求重放**（同 `logid`）才命中覆盖，故 log-reader 重启补读（`-b`）或重发不会产生重复行；同秒同 Key 同模型的并发请求各自成行（bfenetworks/bfe#1417 修复前唯一键缺 `logid`，这类请求会互相覆盖、丢 (n−1)/n 行）；
 - **零值规则**：可空字符串空串写 `NULL`（下游聚合 `IFNULL/COALESCE` 归一，与 Doris 口径一致）；NOT NULL 字符串列（AI 缓存/镜像/意图段字符串列）空串原样写 `''`；数值/布尔原样写入；空 JSON 值写 `NULL`；`ai_intent_confidence`/`ai_intent_latency_us`/`ai_intent_cache_hit` 三个可空意图数值列为 proto optional，未设置（指针 nil）写 `NULL`（=未求值），显式置 0 写 0（与 report 查询契约一致）；
 - **标签打平**：`levelNName/levelN` 在写入时由 `ai_apikeytags` 打平，不等价于 Doris 侧由 Routine Load 表达式打平，效果一致；
 - **分区分区**：表按天 RANGE 分区（`TO_DAYS(log_time)`），新分区创建与过期分区 DROP 由报表查询侧（ai-gateway-api）的分区管理 JOB 负责，本模块不参与。
@@ -108,6 +108,7 @@ Modules = mod_log_mysql
 | `MYSQL_CONN_RETRY` | 建连重试累计次数 | 随 `ConnectRetryIntervalMs` 节奏增长即重试循环正常 |
 | `MYSQL_CONN_OK` | 建连成功累计次数 | 启动以来成功建连次数（正常运行恒为 1，每次运行期重连 +1） |
 | `MYSQL_CONN_LOST` | 运行期断连次数 | 写重试耗尽或探活失败触发；持续增长说明链路抖动或 MySQL 不稳定 |
+| `LOGID_EMPTY` | `logid` 为 0 的明细行数（bfenetworks/bfe#1417） | **非 0 即需排查**：该行无法按请求级判别列去重，退化为旧四元组语义（同秒同 Key 同模型的并发请求仍会互相覆盖）。bfe 侧已保证 `logid` 非 0 |
 
 ## 排障要点
 

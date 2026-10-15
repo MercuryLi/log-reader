@@ -288,3 +288,52 @@ func writeInitConf(t *testing.T, content string) string {
 	}
 	return confRoot
 }
+
+// TestModuleLogMysql_Update_LogidEmpty 覆盖 LOGID_EMPTY 计数器（bfenetworks/bfe#1417）：
+// 新唯一键 (hostid, log_time, ai_apikey_id, ai_requested_model, logid) 下 logid 为 0
+// 会参与比较，该行退化为旧四元组语义（同秒同 Key 同模型的并发请求仍互相覆盖），
+// 因此这种行必须可观测——bfe 侧已保证非 0，出现即为异常（建议阈值 0）。
+func TestModuleLogMysql_Update_LogidEmpty(t *testing.T) {
+	m := newTestModule()
+
+	logid := uint64(91001)
+	zeroLogid := uint64(0)
+	ts := uint64(100)
+	product := bfe_access_pb.ProductID_BFE
+	newReqLog := func() *bfe_access_pb.RequestLog {
+		return &bfe_access_pb.RequestLog{ErrCode: strPtr(""), ErrMsg: strPtr("")}
+	}
+
+	m.Update([]*bfe_access_pb.BfeLog{
+		// 正常行：logid 非 0，不计入
+		{
+			Logid: &logid, Timestamp: &ts, Product: &product,
+			LogType: bfe_access_pb.BfeLogType_Request.Enum(), RequestLog: newReqLog(),
+		},
+		// 显式 0
+		{
+			Logid: &zeroLogid, Timestamp: &ts, Product: &product,
+			LogType: bfe_access_pb.BfeLogType_Request.Enum(), RequestLog: newReqLog(),
+		},
+		// proto optional 缺省（GetLogid() == 0）
+		{
+			Timestamp: &ts, Product: &product,
+			LogType: bfe_access_pb.BfeLogType_Request.Enum(), RequestLog: newReqLog(),
+		},
+		// session 日志不参与明细表去重，不应计入
+		{
+			Logid: &zeroLogid, LogType: bfe_access_pb.BfeLogType_Session.Enum(),
+		},
+	})
+
+	if got := m.state.GetCounter("RECEIVED_REQ"); got != 3 {
+		t.Errorf("RECEIVED_REQ = %d, want 3", got)
+	}
+	if got := m.state.GetCounter("LOGID_EMPTY"); got != 2 {
+		t.Errorf("LOGID_EMPTY = %d, want 2 (zero logid + missing logid)", got)
+	}
+	// 计数不影响写入路径
+	if got := m.state.GetCounter("SENT_TO_MYSQL"); got != 3 {
+		t.Errorf("SENT_TO_MYSQL = %d, want 3", got)
+	}
+}
