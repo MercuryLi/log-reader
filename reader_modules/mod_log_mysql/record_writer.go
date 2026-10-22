@@ -17,7 +17,10 @@ package mod_log_mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,10 +28,17 @@ import (
 
 	"github.com/bfenetworks/go-lib/log"
 	"github.com/bfenetworks/go-lib/web-monitor/module_state2"
+	gomysql "github.com/go-sql-driver/mysql"
 )
 
 // retryBackoffMs 写失败重试的指数退避间隔（毫秒）：200ms/400ms/800ms
 var retryBackoffMs = []int64{200, 400, 800}
+
+// rowDropLogInterval 行剔除 Warn 日志的最小间隔（限频，防毒化批持续刷屏）
+const rowDropLogInterval = time.Minute
+
+// atRowRe 从 MySQL 错误消息中解析多值 INSERT 的行号（按 VALUES 列表 1 起始计数）
+var atRowRe = regexp.MustCompile(`at row (\d+)`)
 
 // connector 建立并验证一个 MySQL 连接（open + 超时 ping + 连接池参数），
 // 作为 RecordWriter 的注入缝：单测替换为"前 N 次失败、第 N+1 次成功"的桩
@@ -62,6 +72,12 @@ func defaultConnector(conf *ConfModLogMysql) (*sql.DB, error) {
 	return db, nil
 }
 
+// pkColumn 主键摘要列（列名 + 列序下标），用于被剔除行的事后追查
+type pkColumn struct {
+	name string
+	idx  int
+}
+
 // RecordWriter 批量写入器：缓冲队列 + 单写协程攒批 + 事务批插 + 退避重试。
 // 建连由 connSupervisor 负责（启动未连通、运行期断连均后台重试，Connect 幂等
 // 可反复调用）；writeLoop 在建连信号到达前挂起不消费，行数据在缓冲队列中
@@ -82,6 +98,9 @@ type RecordWriter struct {
 	stmtHead string // INSERT INTO <table> (cols...) VALUES
 	stmtRow  string // (?,...,?)，按列数预生成
 	stmtTail string // ON DUPLICATE KEY UPDATE col=VALUES(col),...（全列覆盖）
+
+	pkCols         []pkColumn // logid/log_time/ai_apikey_id/ai_requested_model 摘要列
+	lastRowDropLog time.Time  // 行剔除 Warn 日志限频时间戳（仅 writeLoop 协程读写）
 }
 
 // NewRecordWriter 创建 RecordWriter（不启动协程，需调用 Start；
@@ -110,6 +129,17 @@ func NewRecordWriter(conf *ConfModLogMysql, state *module_state2.State) *RecordW
 		sb.WriteString(col + "=VALUES(" + col + ")")
 	}
 	w.stmtTail = sb.String()
+
+	// 主键摘要列（剔除行追查用）：列不存在时跳过，不影响摘要输出
+	colIdx := make(map[string]int, len(cols))
+	for i, c := range cols {
+		colIdx[c] = i
+	}
+	for _, name := range []string{"logid", "log_time", "ai_apikey_id", "ai_requested_model"} {
+		if i, ok := colIdx[name]; ok {
+			w.pkCols = append(w.pkCols, pkColumn{name: name, idx: i})
+		}
+	}
 
 	return w
 }
@@ -347,20 +377,63 @@ func (w *RecordWriter) writeLoop() {
 	}
 }
 
-// writeBatchWithRetry 单事务批插，失败按 200ms/400ms/800ms 退避重试至 MaxRetries。
-// 耗尽即判定连接失效：markDown 置 DOWN 触发 supervisor 重连，并持有该批
+// writeBatchWithRetry 单事务批插；失败先做行级隔离（可定位到行的数据错误
+// 按行剔除后立即重写剩余行），否则按 200ms/400ms/800ms 退避重试至 MaxRetries。
+// 重试耗尽即判定连接失效：markDown 置 DOWN 触发 supervisor 重连，并持有该批
 // 待重连成功后优先补写（不占 QueueSize、保序优于 re-enqueue）；补写仍失败
 // 才计数 SEND_MYSQL_FAILED 丢弃。运行期断连因此不再线性丢批
 func (w *RecordWriter) writeBatchWithRetry(batch [][]interface{}) {
+	// 首个尝试（对应既有 attempt 1，无退避 sleep）
 	var err error
-	for attempt := 0; attempt <= w.conf.Writer.MaxRetries; attempt++ {
-		if attempt > 0 {
-			backoff := retryBackoffMs[attempt-1]
-			if attempt-1 >= len(retryBackoffMs) {
-				backoff = retryBackoffMs[len(retryBackoffMs)-1]
-			}
-			time.Sleep(time.Duration(backoff) * time.Millisecond)
+	if !w.Connected() {
+		err = fmt.Errorf("mod_log_mysql: not connected")
+	} else {
+		err = w.writeBatch(batch)
+		if err == nil {
+			w.state.Inc("WRITE_BATCH_SIZE", len(batch))
+			return
 		}
+	}
+
+	// 行级隔离（issue #12）：可定位到行的数据类错误（1264/1406 + "at row N"）
+	// 重试同一语句无收敛可能，剔除报错行后立即以剩余行重建语句重写——
+	// 不占 MaxRetries、不 sleep、不 markDown、不计 SEND_MYSQL_FAILED；
+	// 单批剔除次数以批大小为界，剔除后批空视为本批处理完成。剔除后若出现
+	// 非行定位错误（连接断开/结构性错误）则转既有退避/markDown 路径
+	for {
+		n, ok := rowErrorIndex(err, len(batch))
+		if !ok {
+			break
+		}
+		w.evictRow(batch[n-1], err)
+		batch = append(batch[:n-1], batch[n:]...)
+		if len(batch) == 0 {
+			return
+		}
+		err = w.writeBatch(batch)
+		if err == nil {
+			w.state.Inc("WRITE_BATCH_SIZE", len(batch))
+			return
+		}
+	}
+
+	log.Logger.Error("mod_log_mysql: write batch failed (attempt 1/%d): %v",
+		w.conf.Writer.MaxRetries+1, err)
+	w.retryWriteBatch(batch)
+}
+
+// retryWriteBatch 既有退避重试路径（首尝试已执行并失败）：按
+// 200ms/400ms/800ms 退避重试至 MaxRetries，耗尽 markDown 置 DOWN 触发
+// supervisor 重连，并持有该批待重连成功后优先补写；补写仍失败才计数
+// SEND_MYSQL_FAILED 丢弃
+func (w *RecordWriter) retryWriteBatch(batch [][]interface{}) {
+	var err error
+	for attempt := 1; attempt <= w.conf.Writer.MaxRetries; attempt++ {
+		backoff := retryBackoffMs[attempt-1]
+		if attempt-1 >= len(retryBackoffMs) {
+			backoff = retryBackoffMs[len(retryBackoffMs)-1]
+		}
+		time.Sleep(time.Duration(backoff) * time.Millisecond)
 
 		if !w.Connected() {
 			err = fmt.Errorf("mod_log_mysql: not connected")
@@ -388,6 +461,53 @@ func (w *RecordWriter) writeBatchWithRetry(batch [][]interface{}) {
 	}
 	w.state.Inc("SEND_MYSQL_FAILED", 1)
 	log.Logger.Error("mod_log_mysql: rewrite after reconnect failed, dropped %d rows", len(batch))
+}
+
+// rowErrorIndex 判断 err 是否为可定位到行的数据类错误：*mysql.MySQLError
+// 1264（out of range）/1406（data too long）且消息含 "at row N"（多值 INSERT
+// 按 VALUES 列表 1 起始计数，映射 batch[N-1]）。行号缺失/越界保守返回
+// ok=false，回落既有退避/markDown 路径
+func rowErrorIndex(err error, batchLen int) (n int, ok bool) {
+	var me *gomysql.MySQLError
+	if !errors.As(err, &me) {
+		return 0, false
+	}
+	if me.Number != 1264 && me.Number != 1406 {
+		return 0, false
+	}
+	m := atRowRe.FindStringSubmatch(me.Message)
+	if m == nil {
+		return 0, false
+	}
+	rowNum, convErr := strconv.Atoi(m[1])
+	if convErr != nil || rowNum < 1 || rowNum > batchLen {
+		return 0, false
+	}
+	return rowNum, true
+}
+
+// evictRow 记录被剔除行的主键摘要（限频 Warn）并计数 ROW_DROPPED_DATA：
+// 行定位类数据错误（范围表未覆盖的列/新错误码）按行丢弃，属数据错误而非
+// 连接/结构性故障，不触发 markDown、不计 SEND_MYSQL_FAILED
+func (w *RecordWriter) evictRow(row []interface{}, cause error) {
+	w.state.Inc("ROW_DROPPED_DATA", 1)
+	if time.Since(w.lastRowDropLog) >= rowDropLogInterval {
+		w.lastRowDropLog = time.Now()
+		log.Logger.Warn("mod_log_mysql: dropped row (%s) due to row data error: %v",
+			w.rowDigest(row), cause)
+	}
+}
+
+// rowDigest 输出行的主键摘要（logid/log_time/ai_apikey_id/ai_requested_model），
+// 供被剔除行事后追查（只记主键，不记录行数据）
+func (w *RecordWriter) rowDigest(row []interface{}) string {
+	parts := make([]string, 0, len(w.pkCols))
+	for _, c := range w.pkCols {
+		if c.idx < len(row) {
+			parts = append(parts, c.name+"="+fmt.Sprintf("%v", row[c.idx]))
+		}
+	}
+	return strings.Join(parts, ",")
 }
 
 // writeBatch 单事务执行多值 INSERT ... ON DUPLICATE KEY UPDATE。

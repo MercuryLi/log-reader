@@ -89,6 +89,8 @@ Modules = mod_log_mysql
 - **幂等**：唯一键 `(hostid, log_time, ai_apikey_id, ai_requested_model, logid)`，冲突覆盖更新——只有**同一请求重放**（同 `logid`）才命中覆盖，故 log-reader 重启补读（`-b`）或重发不会产生重复行；同秒同 Key 同模型的并发请求各自成行（bfenetworks/bfe#1417 修复前唯一键缺 `logid`，这类请求会互相覆盖、丢 (n−1)/n 行）；
 - **零值规则**：可空字符串空串写 `NULL`（下游聚合 `IFNULL/COALESCE` 归一，与 Doris 口径一致）；NOT NULL 字符串列（AI 缓存/镜像/意图段字符串列）空串原样写 `''`；数值/布尔原样写入；空 JSON 值写 `NULL`；`ai_intent_confidence`/`ai_intent_latency_us`/`ai_intent_cache_hit` 三个可空意图数值列为 proto optional，未设置（指针 nil）写 `NULL`（=未求值），显式置 0 写 0（与 report 查询契约一致）；
 - **标签打平**：`levelNName/levelN` 在写入时由 `ai_apikeytags` 打平，不等价于 Doris 侧由 Routine Load 表达式打平，效果一致；
+- **范围归一化**：17 个数值列按 DDL 列类型声明写入上限（`INT` 2147483647、`res_status_code` SMALLINT 32767、`backend_retry` TINYINT 127），超界值写入前 clamp 到列上限并计数 `VALUE_NORMALIZED`（issue #12：pb `uint32` 值域大于列类型，原样写入会触发 MySQL 1264 使整批失败）；
+- **行级隔离**：批写入命中可定位到行的数据错误（1264/1406 + `at row N`）时剔除该行、立即重写剩余行（不占退避重试次数、不断连），计数 `ROW_DROPPED_DATA`——单行异常不再毒化整批（issue #12）；
 - **分区分区**：表按天 RANGE 分区（`TO_DAYS(log_time)`），新分区创建与过期分区 DROP 由报表查询侧（ai-gateway-api）的分区管理 JOB 负责，本模块不参与。
 
 ## 监控指标
@@ -109,6 +111,8 @@ Modules = mod_log_mysql
 | `MYSQL_CONN_OK` | 建连成功累计次数 | 启动以来成功建连次数（正常运行恒为 1，每次运行期重连 +1） |
 | `MYSQL_CONN_LOST` | 运行期断连次数 | 写重试耗尽或探活失败触发；持续增长说明链路抖动或 MySQL 不稳定 |
 | `LOGID_EMPTY` | `logid` 为 0 的明细行数（bfenetworks/bfe#1417） | **非 0 即需排查**：该行无法按请求级判别列去重，退化为旧四元组语义（同秒同 Key 同模型的并发请求仍会互相覆盖）。bfe 侧已保证 `logid` 非 0 |
+| `VALUE_NORMALIZED` | 因超界被 clamp 到列上限的字段值个数（issue #12，按字段值计） | **稳态恒 0；非 0 即需排查**：说明上游产生了超出 DDL 列类型的值（如 `proxy_delay_time` 超 `INT` 上限），写入侧已 clamp 到列上限保证落库，但取值来源需在 BFE 侧核查 |
+| `ROW_DROPPED_DATA` | 因行定位类数据错误（1264/1406 + `at row N`）被剔除丢弃的行数（issue #12） | **正常路径恒 0；非 0 即需排查**：说明出现了范围表未覆盖的列或新错误码，需补充列范围表。剔除按行进行：不触发断连（`MYSQL_CONN_LOST` 不增）、不计 `SEND_MYSQL_FAILED` |
 
 ## 排障要点
 

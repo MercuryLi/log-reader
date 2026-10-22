@@ -17,6 +17,7 @@ package mod_log_mysql
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/bfenetworks/go-lib/web-monitor/module_state2"
+	gomysql "github.com/go-sql-driver/mysql"
 )
 
 func newTestConf() *ConfModLogMysql {
@@ -676,4 +678,136 @@ func TestRecordWriter_PingFailureTriggersMarkDown(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("MYSQL_CONN_LOST still 0 after 5s (health ping should have failed)")
+}
+
+// outOfRangeErr builds the driver error observed in issue #12: Error 1264 with
+// the row locator "at row N" (1-based over the multi-value VALUES list).
+func outOfRangeErr(n int) error {
+	return &gomysql.MySQLError{
+		Number:  1264,
+		Message: fmt.Sprintf("Out of range value for column 'proxy_delay_time' at row %d", n),
+	}
+}
+
+// TestRecordWriter_RowEviction (issue #12): a batch write failing with a
+// row-locatable data error (1264 + "at row N") must drop only that row, rewrite
+// the remainder immediately (no backoff, no markDown), count the dropped row
+// in ROW_DROPPED_DATA and the landed rows in WRITE_BATCH_SIZE.
+func TestRecordWriter_RowEviction(t *testing.T) {
+	conf := newTestConf()
+	conf.Writer.BatchSize = 3
+	w, mock, state := newTestWriterWithConf(t, conf)
+
+	// batch of 3: first attempt fails locating row 2, rewrite of 2 rows succeeds
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(expectedInsertSQL("test_table", ddlColumns, 3))).
+		WillReturnError(outOfRangeErr(2))
+	mock.ExpectRollback()
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(expectedInsertSQL("test_table", ddlColumns, 2))).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectCommit()
+
+	w.Start()
+	for i := 0; i < 3; i++ {
+		if !w.Enqueue(makeRow()) {
+			t.Fatalf("Enqueue %d failed", i)
+		}
+	}
+
+	waitForCounter(t, state, "WRITE_BATCH_SIZE", 2, 5*time.Second)
+	w.Close()
+
+	if got := state.GetCounter("ROW_DROPPED_DATA"); got != 1 {
+		t.Errorf("ROW_DROPPED_DATA = %d, want 1", got)
+	}
+	if got := state.GetCounter("SEND_MYSQL_FAILED"); got != 0 {
+		t.Errorf("SEND_MYSQL_FAILED = %d, want 0 (row eviction is not a structural error)", got)
+	}
+	if got := state.GetCounter("MYSQL_CONN_LOST"); got != 0 {
+		t.Errorf("MYSQL_CONN_LOST = %d, want 0 (no markDown on data errors)", got)
+	}
+	if !w.Connected() {
+		t.Error("writer should stay connected after row eviction")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations: %v", err)
+	}
+}
+
+// TestRecordWriter_RowEvictionAllRows: every row of the batch is out of range;
+// each eviction retries the remainder until the batch is empty, which is a
+// normal completion (no markDown, no SEND_MYSQL_FAILED, bounded loop).
+func TestRecordWriter_RowEvictionAllRows(t *testing.T) {
+	conf := newTestConf()
+	conf.Writer.BatchSize = 2
+	w, mock, state := newTestWriterWithConf(t, conf)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(expectedInsertSQL("test_table", ddlColumns, 2))).
+		WillReturnError(outOfRangeErr(1))
+	mock.ExpectRollback()
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(expectedInsertSQL("test_table", ddlColumns, 1))).
+		WillReturnError(outOfRangeErr(1))
+	mock.ExpectRollback()
+
+	w.Start()
+	for i := 0; i < 2; i++ {
+		if !w.Enqueue(makeRow()) {
+			t.Fatalf("Enqueue %d failed", i)
+		}
+	}
+
+	waitForCounter(t, state, "ROW_DROPPED_DATA", 2, 5*time.Second)
+	w.Close()
+
+	if got := state.GetCounter("WRITE_BATCH_SIZE"); got != 0 {
+		t.Errorf("WRITE_BATCH_SIZE = %d, want 0 (no row landed)", got)
+	}
+	if got := state.GetCounter("SEND_MYSQL_FAILED"); got != 0 {
+		t.Errorf("SEND_MYSQL_FAILED = %d, want 0", got)
+	}
+	if got := state.GetCounter("MYSQL_CONN_LOST"); got != 0 {
+		t.Errorf("MYSQL_CONN_LOST = %d, want 0", got)
+	}
+	if !w.Connected() {
+		t.Error("writer should stay connected after dropping the whole batch")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations: %v", err)
+	}
+}
+
+// TestRecordWriter_RowEvictionRowNumberUnparseable: a 1264 error without a
+// parseable "at row N" locator conservatively falls back to the existing
+// backoff/markDown path (the batch is held and rewritten after reconnect).
+func TestRecordWriter_RowEvictionRowNumberUnparseable(t *testing.T) {
+	conf := newTestConf()
+	conf.Writer.BatchSize = 1
+	conf.Writer.MaxRetries = 0 // single failing attempt on db1
+	w, mock, state := newTestWriterWithConf(t, conf)
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO test_table").
+		WillReturnError(&gomysql.MySQLError{Number: 1264, Message: "Out of range value for column 'c'"})
+	mock.ExpectRollback()
+
+	w.Start()
+	if !w.Enqueue(makeRow()) {
+		t.Fatal("Enqueue failed")
+	}
+
+	waitForCounter(t, state, "ROW_DROPPED_DATA", 0, 100*time.Millisecond)
+	w.Close()
+
+	if got := state.GetCounter("ROW_DROPPED_DATA"); got != 0 {
+		t.Errorf("ROW_DROPPED_DATA = %d, want 0 (unparseable row number: fallback path)", got)
+	}
+	if got := state.GetCounter("MYSQL_CONN_LOST"); got != 1 {
+		t.Errorf("MYSQL_CONN_LOST = %d, want 1 (fallback to markDown)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations: %v", err)
+	}
 }

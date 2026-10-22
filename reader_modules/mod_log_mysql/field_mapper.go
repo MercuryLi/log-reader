@@ -43,7 +43,8 @@ type columnDef struct {
 	name  string // 表列名
 	field string // mod_fields 抽取字段名（特殊列为空）
 	kind  columnKind
-	level int // kindTagName/kindTagValue 的标签层级
+	level int   // kindTagName/kindTagValue 的标签层级
+	max   int64 // kindScalar 数值列写入上限（按 DDL 列类型）；0 = 无约束
 }
 
 var columnDefs = []columnDef{
@@ -60,7 +61,7 @@ var columnDefs = []columnDef{
 	{name: "client_ip", field: "client_ip", kind: kindScalar},
 	{name: "client_network", field: "client_network", kind: kindScalar},
 	{name: "is_trust_src_ip", field: "is_trust_src_ip", kind: kindBoolTiny},
-	{name: "req_num", field: "req_num", kind: kindScalar},
+	{name: "req_num", field: "req_num", kind: kindScalar, max: 2147483647},
 	{name: "session_id", field: "session_id", kind: kindScalar},
 	{name: "bfe_ip", field: "bfe_ip", kind: kindScalar},
 	{name: "sock_src_ip", field: "sock_src_ip", kind: kindScalar},
@@ -88,33 +89,33 @@ var columnDefs = []columnDef{
 	{name: "uid", field: "uid", kind: kindScalar},
 	{name: "cookie", field: "cookie", kind: kindScalar},
 	{name: "req_headers", field: "req_headers", kind: kindJSON},
-	{name: "req_header_len", field: "req_header_len", kind: kindScalar},
-	{name: "req_body_len", field: "req_body_len", kind: kindScalar},
+	{name: "req_header_len", field: "req_header_len", kind: kindScalar, max: 2147483647},
+	{name: "req_body_len", field: "req_body_len", kind: kindScalar, max: 2147483647},
 
 	// === 路由列 ===
 	{name: "cluster", field: "cluster", kind: kindScalar},
 	{name: "sub_cluster", field: "sub_cluster", kind: kindScalar},
 	{name: "backend_info", field: "backend_info", kind: kindScalar},
-	{name: "backend_retry", field: "backend_retry", kind: kindScalar},
+	{name: "backend_retry", field: "backend_retry", kind: kindScalar, max: 127},
 
 	// === 响应列 ===
-	{name: "res_status_code", field: "res_status_code", kind: kindScalar},
-	{name: "res_header_len", field: "res_header_len", kind: kindScalar},
-	{name: "res_body_len", field: "res_body_len", kind: kindScalar},
+	{name: "res_status_code", field: "res_status_code", kind: kindScalar, max: 32767},
+	{name: "res_header_len", field: "res_header_len", kind: kindScalar, max: 2147483647},
+	{name: "res_body_len", field: "res_body_len", kind: kindScalar, max: 2147483647},
 	{name: "res_content_type", field: "res_content_type", kind: kindScalar},
 	{name: "res_location", field: "res_location", kind: kindScalar},
 	{name: "res_transfer_encoding", field: "res_transfer_encoding", kind: kindScalar},
 	{name: "res_headers", field: "res_headers", kind: kindJSON},
 
 	// === 耗时列（毫秒） ===
-	{name: "all_time", field: "all_time", kind: kindScalar},
-	{name: "read_client_time", field: "read_client_time", kind: kindScalar},
-	{name: "cluster_serve_time", field: "cluster_serve_time", kind: kindScalar},
-	{name: "backend_serve_time", field: "backend_serve_time", kind: kindScalar},
-	{name: "write_client_time", field: "write_client_time", kind: kindScalar},
-	{name: "connect_backend_time", field: "connect_backend_time", kind: kindScalar},
-	{name: "proxy_delay_time", field: "proxy_delay_time", kind: kindScalar},
-	{name: "session_offset_time", field: "session_offset_time", kind: kindScalar},
+	{name: "all_time", field: "all_time", kind: kindScalar, max: 2147483647},
+	{name: "read_client_time", field: "read_client_time", kind: kindScalar, max: 2147483647},
+	{name: "cluster_serve_time", field: "cluster_serve_time", kind: kindScalar, max: 2147483647},
+	{name: "backend_serve_time", field: "backend_serve_time", kind: kindScalar, max: 2147483647},
+	{name: "write_client_time", field: "write_client_time", kind: kindScalar, max: 2147483647},
+	{name: "connect_backend_time", field: "connect_backend_time", kind: kindScalar, max: 2147483647},
+	{name: "proxy_delay_time", field: "proxy_delay_time", kind: kindScalar, max: 2147483647},
+	{name: "session_offset_time", field: "session_offset_time", kind: kindScalar, max: 2147483647},
 
 	// === API Key 标签打平列（写时从 ai_apikeytags 打平） ===
 	{name: "level1Name", kind: kindTagName, level: 1},
@@ -144,7 +145,7 @@ var columnDefs = []columnDef{
 	{name: "ai_provider", field: "ai_provider", kind: kindScalar},
 	{name: "ai_protocol", field: "ai_protocol", kind: kindScalar},
 	{name: "ai_mode", field: "ai_mode", kind: kindScalar},
-	{name: "ai_retry_count", field: "ai_retry_count", kind: kindScalar},
+	{name: "ai_retry_count", field: "ai_retry_count", kind: kindScalar, max: 2147483647},
 	{name: "ai_cost_value", field: "ai_cost_value", kind: kindScalar},
 	{name: "ai_cost_currency", field: "ai_cost_currency", kind: kindScalar},
 
@@ -173,11 +174,51 @@ var columnDefs = []columnDef{
 
 // FieldMapper 将 BfeLog 组装为固定列序的数据行
 type FieldMapper struct {
+	// onNormalized 在数值列值超界被 clamp 到列上限时回调（参数为列名）；
+	// 可为 nil（静默归一化）
+	onNormalized func(col string)
 }
 
 // NewFieldMapper 创建 FieldMapper
 func NewFieldMapper() *FieldMapper {
 	return &FieldMapper{}
+}
+
+// SetOnNormalized 注入归一化事件回调（模块组装时注入计数与限频日志）
+func (m *FieldMapper) SetOnNormalized(f func(col string)) {
+	m.onNormalized = f
+}
+
+// clampNumeric 将 kindScalar 抽取值收敛到列写入上限：仅处理整数数值类型
+// （uint32/uint64/int64 等 mod_fields 可能返回的类型），超界写 max；
+// 非数值类型原样返回。max <= 0 表示该列无范围约束。
+func clampNumeric(v interface{}, max int64) (interface{}, bool) {
+	if max <= 0 {
+		return v, false
+	}
+	switch n := v.(type) {
+	case uint32:
+		if uint64(n) > uint64(max) {
+			return max, true
+		}
+	case uint64:
+		if n > uint64(max) {
+			return max, true
+		}
+	case int64:
+		if n > max {
+			return max, true
+		}
+	case int32:
+		if int64(n) > max {
+			return max, true
+		}
+	case int:
+		if int64(n) > max {
+			return max, true
+		}
+	}
+	return v, false
 }
 
 // Columns 返回表列名清单（按写入列序），供测试与 RecordWriter 共用
@@ -256,6 +297,7 @@ func flattenTag(tags map[string]interface{}, level int) (name interface{}, value
 // ToRow 将 BfeLog 组装为一行数据（固定 99 列列序）。
 // 字符串零值 -> NULL（kindNotNullStr 列除外：空串原样写入，匹配 NOT NULL 列）；
 // 数值/布尔原样（布尔 TINYINT 列转 0/1；kindOptionalNum 列：proto 未设置 -> NULL）；
+// 声明了 max 的数值列超界 clamp 到列上限并触发 onNormalized 回调；
 // JSON 列 marshal 后写入、空 -> NULL；标签缺失 -> NULL。
 func (m *FieldMapper) ToRow(log *bfe_access_pb.BfeLog) ([]interface{}, error) {
 	row := make([]interface{}, 0, len(columnDefs))
@@ -329,6 +371,13 @@ func (m *FieldMapper) ToRow(log *bfe_access_pb.BfeLog) ([]interface{}, error) {
 					row = append(row, nil)
 					continue
 				}
+			}
+			// 数值列超界 clamp 到列上限（DDL 列类型），不产生 MySQL 1264
+			if nv, clamped := clampNumeric(v, col.max); clamped {
+				if m.onNormalized != nil {
+					m.onNormalized(col.name)
+				}
+				v = nv
 			}
 			row = append(row, v)
 		}

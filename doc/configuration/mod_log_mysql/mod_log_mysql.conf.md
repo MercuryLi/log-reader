@@ -108,3 +108,5 @@ MaxIdleConns = 5
 | MYSQL_CONN_OK | 建连成功累计次数 |
 | MYSQL_CONN_LOST | 运行期断连次数（写重试耗尽/探活失败触发） |
 | LOGID_EMPTY | `logid` 为 0 的明细行数（bfenetworks/bfe#1417）：该行无法按请求级判别列去重，退化为旧四元组语义（同秒同 Key 同模型的并发请求仍会互相覆盖）。正常应为 0——bfe 侧已保证 `logid` 非 0，非 0 即需排查 |
+| VALUE_NORMALIZED | 因超界被 clamp 到列上限的字段值个数（按字段值计，非按行；issue #12）。稳态恒 0；非 0 说明上游（BFE 侧）产生了超出 DDL 列类型的值，需排查取值来源 |
+| ROW_DROPPED_DATA | 因行定位类数据错误（MySQL 1264/1406 + `at row N`）被剔除丢弃的行数（issue #12）。正常路径（写入前归一化生效后）恒 0；非 0 说明出现了范围表未覆盖的列或新错误码，需补范围表（剔除按行进行，不触发断连、不计 `SEND_MYSQL_FAILED`） |
