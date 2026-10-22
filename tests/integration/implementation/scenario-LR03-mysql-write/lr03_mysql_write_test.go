@@ -44,6 +44,7 @@ type testEnv struct {
 	logDir      string
 	logFilePath string
 	logGen      *common.LogGenerator
+	monitorPort int
 	stopReader  func()
 }
 
@@ -65,11 +66,16 @@ func newTestEnv(t *testing.T) *testEnv {
 	}
 	e.logFilePath = filepath.Join(e.logDir, "pb_access3.log")
 
+	// Pin the monitor port up front: tests asserting on counters poll
+	// /monitor/mod_log_mysql while the process runs.
+	e.monitorPort = common.FreePort(t)
+
 	// Build log-reader config.
 	builder := &common.LogReaderConfigBuilder{
 		TemplateDir:   "testdata",
 		TargetConfDir: e.confDir,
 		LogFilePath:   e.logFilePath,
+		HttpPort:      e.monitorPort,
 		MysqlAddr:     addr,
 		MysqlUser:     user,
 		MysqlPassword: passwd,
@@ -92,7 +98,7 @@ func newTestEnv(t *testing.T) *testEnv {
 }
 
 func (e *testEnv) startReader() {
-	_, e.stopReader = e.processEnv.StartLogReader(e.confDir, e.logDir)
+	e.stopReader, _ = e.processEnv.StartLogReaderOnPort(e.confDir, e.logDir, e.monitorPort)
 }
 
 func (e *testEnv) Close() {
@@ -721,5 +727,115 @@ func TestLR03_ConcurrentRowsSameSecondSurvive(t *testing.T) {
 
 	if n := e.mysqlEnv.TableCount(t, tableName); n != 2 {
 		t.Fatalf("row count after replay = %d, want 2 (same logid must be overwritten, not appended)", n)
+	}
+}
+
+// TestLR03_OutOfRangeValueSurvives (issue #12, SC2201-TC007 A-09/A-10) verifies
+// end to end that a uint32 value above the DDL INT range no longer poisons its
+// whole write batch: every row of the batch must land (the out-of-range ones
+// normalized to the column max), no connection is marked down and no batch is
+// counted as failed.
+//
+// Rows: 4 proxy_delay_time probes (0, INT max, INT max+1, uint32 max) plus a
+// normal row and a 401 auth-reject row, written as one batch.
+func TestLR03_OutOfRangeValueSurvives(t *testing.T) {
+	e := newTestEnv(t)
+	defer e.Close()
+
+	type probe struct {
+		logid  uint64
+		model  string
+		delay  uint32
+		wantDB int64
+	}
+	probes := []probe{
+		{logid: 93001, model: "probe-delay-zero", delay: 0, wantDB: 0},
+		{logid: 93002, model: "probe-delay-int-max", delay: 2147483647, wantDB: 2147483647},
+		{logid: 93003, model: "probe-delay-int-max-plus-1", delay: 2147483648, wantDB: 2147483647},
+		{logid: 93004, model: "probe-delay-uint32-max", delay: 4294967295, wantDB: 2147483647},
+	}
+
+	for _, p := range probes {
+		log := common.MakeRequestLog(p.logid, bfe_access_pb.ProductID_BFE,
+			"oor.example.org", "/v1/chat", p.model)
+		log.RequestLog.ProxyDelayTime = proto.Uint32(p.delay)
+		e.logGen.MustWriteBfeLog(t, log)
+	}
+
+	// Normal row and 401 auth-reject row mixed into the same write batch.
+	normal := common.MakeRequestLog(93005, bfe_access_pb.ProductID_BFE,
+		"oor.example.org", "/v1/chat", "probe-normal")
+	normal.RequestLog.ProxyDelayTime = proto.Uint32(3)
+	e.logGen.MustWriteBfeLog(t, normal)
+
+	unauthorized := common.MakeRequestLog(93006, bfe_access_pb.ProductID_BFE,
+		"oor.example.org", "/v1/chat", "probe-401")
+	unauthorized.RequestLog.ResStatusCode = proto.Uint32(401)
+	e.logGen.MustWriteBfeLog(t, unauthorized)
+
+	const total = 6
+	e.waitRows(total, 30*time.Second)
+	if got := e.mysqlEnv.TableCount(t, tableName); got != total {
+		e.dumpLogs()
+		t.Fatalf("table %s row count = %d, want %d (an out-of-range value must not drop the batch)",
+			tableName, got, total)
+	}
+
+	// In-range values land as-is; out-of-range values are read back as the
+	// column max (2147483647), never as MySQL 1264 / dropped rows.
+	for _, p := range probes {
+		var delay sql.NullInt64
+		if err := e.mysqlEnv.DB().QueryRow(
+			`SELECT proxy_delay_time FROM `+tableName+` WHERE logid = ?`, p.logid).Scan(&delay); err != nil {
+			e.dumpLogs()
+			t.Fatalf("query proxy_delay_time for logid %d failed: %v", p.logid, err)
+		}
+		if !delay.Valid {
+			t.Errorf("logid %d proxy_delay_time is NULL, want %d", p.logid, p.wantDB)
+			continue
+		}
+		if delay.Int64 != p.wantDB {
+			t.Errorf("logid %d proxy_delay_time = %d, want %d (source value %d)",
+				p.logid, delay.Int64, p.wantDB, p.delay)
+		}
+	}
+
+	// The normal row and the 401 auth-reject row survive alongside the probes.
+	var normalDelay sql.NullInt64
+	if err := e.mysqlEnv.DB().QueryRow(
+		`SELECT proxy_delay_time FROM `+tableName+` WHERE logid = ?`, uint64(93005)).Scan(&normalDelay); err != nil {
+		e.dumpLogs()
+		t.Fatalf("query normal row failed: %v", err)
+	}
+	if !normalDelay.Valid || normalDelay.Int64 != 3 {
+		t.Errorf("normal row proxy_delay_time = %v, want 3", normalDelay)
+	}
+
+	var status sql.NullInt64
+	if err := e.mysqlEnv.DB().QueryRow(
+		`SELECT res_status_code FROM `+tableName+` WHERE logid = ?`, uint64(93006)).Scan(&status); err != nil {
+		e.dumpLogs()
+		t.Fatalf("query 401 row failed: %v", err)
+	}
+	if !status.Valid || status.Int64 != 401 {
+		t.Errorf("401 row res_status_code = %v, want 401", status)
+	}
+
+	// Counters: two field values normalized, no structural failure, no markDown.
+	state := common.WaitMonitor(t, e.monitorPort, "mod_log_mysql", 10*time.Second,
+		func(m *common.MonitorState) bool {
+			return m.SCounters["VALUE_NORMALIZED"] >= 2
+		})
+	if got := state.SCounters["VALUE_NORMALIZED"]; got != 2 {
+		t.Errorf("VALUE_NORMALIZED = %d, want 2 (two out-of-range probe values)", got)
+	}
+	if got := state.SCounters["SEND_MYSQL_FAILED"]; got != 0 {
+		t.Errorf("SEND_MYSQL_FAILED = %d, want 0 (data errors are not structural failures)", got)
+	}
+	if got := state.SCounters["MYSQL_CONN_LOST"]; got != 0 {
+		t.Errorf("MYSQL_CONN_LOST = %d, want 0 (no markDown on data errors)", got)
+	}
+	if got := state.SCounters["ROW_DROPPED_DATA"]; got != 0 {
+		t.Errorf("ROW_DROPPED_DATA = %d, want 0 (normalization prevents row eviction)", got)
 	}
 }

@@ -76,6 +76,7 @@ connSupervisor: DOWN 期按 ConnectRetryIntervalMs 重试 Connect；
 | 唯一键取舍 | 唯一键**必须含 `logid`**：四列键下 `log_time` 是秒级（见下），同秒同 Key 同模型的并发请求被全列覆盖压成 1 行——生产实测丢率恰为 (n−1)/n（窗口 13.5%），被覆盖行的 tokens/cost 从求和中整体消失。原设计"唯一键不含 `logid`、以聚合可接受为前提"的取舍**已被 issue #1417 推翻**；含 `logid` 后并发请求各自成行 |
 | `logid=0` 的行 | `0` 参与键比较 → 退化为旧四元组语义（同秒并发仍互相覆盖）。bfe 侧已保证非 0；本模块以 `LOGID_EMPTY` 计数暴露这类行（正常应为 0） |
 | 零值规则 | 字符串空串 → NULL；数值/布尔原样（`ai_stream=0`、`ai_retry_count=0`）；`logid` 恒写整数、不写 NULL（列已 `NOT NULL DEFAULT 0`）；nil/空 JSON → NULL |
+| 范围归一化 | 17 个数值列按 DDL 列类型声明写入上限（`INT` 2147483647、`res_status_code` SMALLINT 32767、`backend_retry` TINYINT 127），超界值写入前 clamp 到列上限并计数 `VALUE_NORMALIZED`（issue #12：pb `uint32` 值域大于 DDL 列类型，原样写入触发 MySQL 1264 毒化整批） |
 | 时间列 | `log_time` 由 pb `timestamp`（Unix 秒）写时转 DATETIME（Doris 链路为 Routine Load `FROM_UNIXTIME`，同口径） |
 | 标签打平 | `levelNName/levelN` 写时从 `ai_apikeytags` 对象打平；无标签 → NULL |
 
@@ -86,6 +87,7 @@ connSupervisor: DOWN 期按 ConnectRetryIntervalMs 重试 Connect；
 - **写失败重试**：失败按 200ms/400ms/800ms 指数退避重试至 `MaxRetries`（默认 3）；耗尽**不再直接丢批**，而是 `markDown` 进入 DOWN 并持有该批（不占 `QueueSize`、保序优于 re-enqueue）；
 - **连接监管（connSupervisor，常驻）**：启动未连通与运行期 `markDown` 共用同一条重试路径——UP 期等待触发（可选 `HealthPingIntervalMs` 周期探活，失败即 markDown，面向半开连接场景）；DOWN 期按 `ConnectRetryIntervalMs` 重试 `Connect`（幂等可反复调用），成功则换代 `connCh` 唤醒写协程，`STATE=UP`、`MYSQL_CONN_OK+1`；写协程与持有批经 `waitConnected`（双重检查防换代竞态）恢复，持有批**优先补写**，随后按批排空积压；
 - **补写仍失败**（结构性错误：表被 DROP、权限被收回）才计数 `SEND_MYSQL_FAILED` 丢弃该批（不落盘死信，恢复后靠 `-b` 补读重放）；
+- **行级隔离（issue #12）**：批写入命中**可定位到行的数据类错误**（`*mysql.MySQLError` 1264/1406 且消息含 `at row N`）时，剔除第 N 行并立即以剩余行重建语句重写（不占退避重试次数、不 sleep、不 `markDown`），计数 `ROW_DROPPED_DATA`；剔除后批空视为本批处理完成；行号解析失败或出现非行定位错误则保守回落上面的退避/补写路径——单行数据异常不再毒化整批，`SEND_MYSQL_FAILED` 语义收窄回结构性错误；
 - **超时控制（写路径有界）**：建连受 `ConnectTimeoutMs` 约束（`PingContext` + DSN `timeout` 拨号参数）；单批事务受 `BatchTimeoutMs` 约束（`BeginTx`/`ExecContext` 截止时间 + DSN `writeTimeout`，后者兼约束 Commit/Rollback）——网络分区（DROP）下写路径秒级失败而非挂死到 OS 级 TCP 超时。`BatchTimeoutMs` 必须大于正常 P99 批执行时间，否则慢批会被误判为断连；
 - **关闭**：`Close()` 停两协程（supervisor 直接退出，writeLoop drain 残留批后最终 flush）→ 关连接池；从未连通则丢弃缓冲行并记 Info 日志（进程退出边界）；
 - **panic 防护**：写协程 recover；停滞可通过 `SENT_TO_MYSQL` 计数停增发现。
@@ -154,6 +156,8 @@ UP ──(写重试耗尽 / 探活失败)──► markDown ──► DOWN ─�
 | `MYSQL_CONN_OK` | 建连成功累计次数 | 正常运行恒为 1，每次运行期重连 +1 |
 | `MYSQL_CONN_LOST` | 运行期断连次数（markDown 触发） | 持续增长 = 链路抖动或 MySQL 不稳定 |
 | `LOGID_EMPTY` | `logid` 为 0 的明细行数（issue #1417） | **非 0 即需排查**：该类行无法按请求级判别列去重，退化为旧四元组语义（同秒同 Key 同模型的并发请求仍会互相覆盖）；bfe 侧已保证 `logid` 非 0 |
+| `VALUE_NORMALIZED` | 因超界被 clamp 到列上限的字段值个数（issue #12，按字段值计） | **稳态恒 0；非 0 即需排查**：上游产生了超出 DDL 列类型的值，写入侧已归一化保证落库，取值来源需在 BFE 侧核查 |
+| `ROW_DROPPED_DATA` | 因行定位类数据错误（1264/1406 + `at row N`）被剔除丢弃的行数（issue #12） | **正常路径恒 0；非 0 即需排查**：出现范围表未覆盖的列或新错误码，需补范围表。剔除不触发 `markDown`（`MYSQL_CONN_LOST` 不增）、不改变 `SEND_MYSQL_FAILED` 的结构性错误语义 |
 
 ## 5. 降级与兼容性
 

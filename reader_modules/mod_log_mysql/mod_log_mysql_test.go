@@ -337,3 +337,58 @@ func TestModuleLogMysql_Update_LogidEmpty(t *testing.T) {
 		t.Errorf("SENT_TO_MYSQL = %d, want 3", got)
 	}
 }
+
+// TestModuleLogMysql_Update_ValueNormalized (issue #12) 覆盖 VALUE_NORMALIZED
+// 计数器：越界列的字段值被 clamp 并计数（Init 注入的 onNormalized 回调），
+// 行仍照常入队；既有计数器不受新计数器影响。
+func TestModuleLogMysql_Update_ValueNormalized(t *testing.T) {
+	m := newTestModule()
+	// 与 Init 相同的组装：注入归一化回调
+	mapper := NewFieldMapper()
+	mapper.SetOnNormalized(newNormalizeMonitor(&m.state).onNormalized)
+	m.mapper = mapper
+
+	logid := uint64(92001)
+	ts := uint64(100)
+	product := bfe_access_pb.ProductID_BFE
+
+	// 越界行：proxy_delay_time = uint32 max（超出 INT 上限）
+	over := &bfe_access_pb.BfeLog{
+		Logid: &logid, Timestamp: &ts, Product: &product,
+		LogType: bfe_access_pb.BfeLogType_Request.Enum(),
+		RequestLog: &bfe_access_pb.RequestLog{
+			ErrCode:        strPtr(""),
+			ErrMsg:         strPtr(""),
+			ProxyDelayTime: uint32Ptr(4294967295),
+		},
+	}
+	// 正常行：范围内值不计数
+	normal := &bfe_access_pb.BfeLog{
+		Logid: &logid, Timestamp: &ts, Product: &product,
+		LogType: bfe_access_pb.BfeLogType_Request.Enum(),
+		RequestLog: &bfe_access_pb.RequestLog{
+			ErrCode:        strPtr(""),
+			ErrMsg:         strPtr(""),
+			ProxyDelayTime: uint32Ptr(2147483647),
+		},
+	}
+
+	m.Update([]*bfe_access_pb.BfeLog{over, normal})
+
+	if got := m.state.GetCounter("VALUE_NORMALIZED"); got != 1 {
+		t.Errorf("VALUE_NORMALIZED = %d, want 1 (one out-of-range field value)", got)
+	}
+	// 归一化不改写入路径：越界行仍入队
+	if got := m.state.GetCounter("SENT_TO_MYSQL"); got != 2 {
+		t.Errorf("SENT_TO_MYSQL = %d, want 2", got)
+	}
+	if got := m.state.GetCounter("RECEIVED_REQ"); got != 2 {
+		t.Errorf("RECEIVED_REQ = %d, want 2", got)
+	}
+	// 既有计数器不受影响
+	for _, key := range []string{"CONVERT_FAILED", "SENT_MYSQL_CHN_FULL", "LOGID_EMPTY", "ROW_DROPPED_DATA"} {
+		if got := m.state.GetCounter(key); got != 0 {
+			t.Errorf("%s = %d, want 0", key, got)
+		}
+	}
+}

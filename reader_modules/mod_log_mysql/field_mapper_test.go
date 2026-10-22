@@ -513,6 +513,134 @@ func TestToRow_CacheMirrorIntentZeroForm(t *testing.T) {
 	}
 }
 
+// TestFieldMapper_RangeClamp 覆盖 §5.2 范围表全量逐列断言（issue #12）：
+// 边界值原样透传，max+1 clamp 到 max；字符串/NULL 规则不受影响；
+// onNormalized 回调按 clamp 次数触发，nil 回调静默。
+func TestFieldMapper_RangeClamp(t *testing.T) {
+	idx := columnIndex(t)
+
+	// §5.2 范围表（proto uint32 -> DDL 列类型）：15 列 INT + res_status_code
+	// SMALLINT(32767) + backend_retry TINYINT(127)。列名 -> RequestLog 字段 setter
+	intCols := []string{
+		"proxy_delay_time", "all_time", "read_client_time", "cluster_serve_time",
+		"backend_serve_time", "write_client_time", "connect_backend_time",
+		"session_offset_time", "req_header_len", "req_body_len",
+		"res_header_len", "res_body_len", "req_num", "ai_retry_count",
+	}
+	setters := map[string]func(rl *bfe_access_pb.RequestLog, v uint32){
+		"proxy_delay_time":     func(rl *bfe_access_pb.RequestLog, v uint32) { rl.ProxyDelayTime = uint32Ptr(v) },
+		"all_time":             func(rl *bfe_access_pb.RequestLog, v uint32) { rl.AllTime = uint32Ptr(v) },
+		"read_client_time":     func(rl *bfe_access_pb.RequestLog, v uint32) { rl.ReadClientTime = uint32Ptr(v) },
+		"cluster_serve_time":   func(rl *bfe_access_pb.RequestLog, v uint32) { rl.ClusterServeTime = uint32Ptr(v) },
+		"backend_serve_time":   func(rl *bfe_access_pb.RequestLog, v uint32) { rl.BackendServeTime = uint32Ptr(v) },
+		"write_client_time":    func(rl *bfe_access_pb.RequestLog, v uint32) { rl.WriteClientTime = uint32Ptr(v) },
+		"connect_backend_time": func(rl *bfe_access_pb.RequestLog, v uint32) { rl.ConnectBackendTime = uint32Ptr(v) },
+		"session_offset_time":  func(rl *bfe_access_pb.RequestLog, v uint32) { rl.SessionOffsetTime = uint32Ptr(v) },
+		"req_header_len":       func(rl *bfe_access_pb.RequestLog, v uint32) { rl.ReqHeaderLen = uint32Ptr(v) },
+		"req_body_len":         func(rl *bfe_access_pb.RequestLog, v uint32) { rl.ReqBodyLen = uint32Ptr(v) },
+		"res_header_len":       func(rl *bfe_access_pb.RequestLog, v uint32) { rl.ResHeaderLen = uint32Ptr(v) },
+		"res_body_len":         func(rl *bfe_access_pb.RequestLog, v uint32) { rl.ResBodyLen = uint32Ptr(v) },
+		"req_num":              func(rl *bfe_access_pb.RequestLog, v uint32) { rl.ReqNum = uint32Ptr(v) },
+		"ai_retry_count":       func(rl *bfe_access_pb.RequestLog, v uint32) { rl.AiRetryCount = uint32Ptr(v) },
+		"res_status_code":      func(rl *bfe_access_pb.RequestLog, v uint32) { rl.ResStatusCode = uint32Ptr(v) },
+		"backend_retry":        func(rl *bfe_access_pb.RequestLog, v uint32) { rl.BackendRetry = uint32Ptr(v) },
+	}
+
+	// case {col, max}：边界值（max 原样）与 max+1（clamp 到 int64(max)）
+	cases := make([]struct {
+		col string
+		max int64
+	}, 0, len(intCols)+2)
+	for _, col := range intCols {
+		cases = append(cases, struct {
+			col string
+			max int64
+		}{col, 2147483647})
+	}
+	cases = append(cases,
+		struct {
+			col string
+			max int64
+		}{"res_status_code", 32767},
+		struct {
+			col string
+			max int64
+		}{"backend_retry", 127})
+
+	for _, tc := range cases {
+		set, ok := setters[tc.col]
+		if !ok {
+			t.Fatalf("no setter for column %s", tc.col)
+		}
+
+		// 边界值原样透传（保持抽取类型 uint32）
+		log := makeBfeLog()
+		set(log.RequestLog, uint32(tc.max))
+		mapper := NewFieldMapper()
+		row, err := mapper.ToRow(log)
+		if err != nil {
+			t.Fatalf("ToRow failed for %s: %v", tc.col, err)
+		}
+		if v := row[idx[tc.col]]; v != uint32(tc.max) {
+			t.Errorf("%s = %v (%T), want uint32(%d) (boundary value kept)", tc.col, v, v, tc.max)
+		}
+
+		// max+1 clamp 到列上限
+		log = makeBfeLog()
+		set(log.RequestLog, uint32(tc.max)+1)
+		row, err = mapper.ToRow(log)
+		if err != nil {
+			t.Fatalf("ToRow failed for %s: %v", tc.col, err)
+		}
+		if v := row[idx[tc.col]]; v != tc.max {
+			t.Errorf("%s = %v (%T), want int64(%d) (max+1 clamped)", tc.col, v, v, tc.max)
+		}
+	}
+}
+
+// TestFieldMapper_RangeClampCallback 断言 onNormalized 回调按 clamp 次数触发
+// （nil 回调静默），且字符串 NULL 规则不受影响。
+func TestFieldMapper_RangeClampCallback(t *testing.T) {
+	idx := columnIndex(t)
+
+	log := makeBfeLog()
+	log.RequestLog.ProxyDelayTime = uint32Ptr(4294967295) // uint32 max -> clamp
+	log.RequestLog.AllTime = uint32Ptr(2147483648)        // INT max+1 -> clamp
+
+	var cols []string
+	mapper := NewFieldMapper()
+	mapper.SetOnNormalized(func(col string) { cols = append(cols, col) })
+	row, err := mapper.ToRow(log)
+	if err != nil {
+		t.Fatalf("ToRow failed: %v", err)
+	}
+
+	if len(cols) != 2 {
+		t.Fatalf("onNormalized called %d times, want 2", len(cols))
+	}
+	if row[idx["proxy_delay_time"]] != int64(2147483647) {
+		t.Errorf("proxy_delay_time = %v, want 2147483647", row[idx["proxy_delay_time"]])
+	}
+	if row[idx["all_time"]] != int64(2147483647) {
+		t.Errorf("all_time = %v, want 2147483647", row[idx["all_time"]])
+	}
+
+	// nil 回调静默，不 panic、行为不变
+	silent := NewFieldMapper()
+	row, err = silent.ToRow(log)
+	if err != nil {
+		t.Fatalf("ToRow with nil callback failed: %v", err)
+	}
+	if row[idx["proxy_delay_time"]] != int64(2147483647) {
+		t.Errorf("nil callback: proxy_delay_time = %v, want 2147483647", row[idx["proxy_delay_time"]])
+	}
+
+	// 字符串 NULL 规则不受 clamp 影响：err_code "" 仍为 NULL
+	if row[idx["err_code"]] != nil {
+		t.Errorf("err_code should stay NULL for empty string, got %v", row[idx["err_code"]])
+	}
+}
+
 // TestToRow_OptionalNumSetZeroKept asserts explicitly-set zero values on the
 // optional columns are written as 0 (not NULL): pointer set -> value, so the
 // consumer can distinguish "evaluated to zero" from "not evaluated" (NULL).
